@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Results (if you don't want test output in git)
+results/
