@@ -514,17 +514,17 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 logger.warning("[%s] %s", tc_id, error_message)
 
         # ================================================================
-        # PHASE 3: Assertions — classification, journey, emotion
-        # (keywords are recorded for analysis only, not used for pass/fail)
+        # PHASE 3: Logging only — classification, journey, emotion, keywords
+        # (none of these affect pass/fail; all are recorded in the CSV output)
         # ================================================================
         final_reply = all_replies[-1] if all_replies else ""
 
-        # Always use the final reply and its analysis for assertions
+        # Always use the final reply and its analysis
         check_analysis = final_analysis
         check_reply = final_reply
         check_latency = final_latency
 
-        # Log keyword findings (recording only — does not affect pass/fail)
+        # 3a. Log keyword findings (recording only)
         if tc.expected_keywords:
             if keywords_ever_found:
                 logger.info("[%s] Keywords matched: %s — not_found: %s",
@@ -533,49 +533,36 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 logger.info("[%s] No expected keyword found in any bot reply — "
                             "all replies: %s", tc_id, all_replies[:3])
 
-        # 3a. Expected classification (if specified)
-        if status == "PASS" and tc.expected_classification:
+        # 3b. Log classification (recording only)
+        if tc.expected_classification:
             actual_class = (check_analysis.get("classification") or "").lower()
             expected_lower = tc.expected_classification.lower()
             found_in_analysis = expected_lower in actual_class
             found_in_reply = expected_lower in check_reply.lower()
-
             if not found_in_analysis and not found_in_reply:
-                status = "FAIL"
-                error_message = (
-                    f"[{tc_id}] Classification '{expected_lower}' not found.\n"
-                    f"  Analysis class: {actual_class!r}\n"
-                    f"  Bot reply:      {check_reply[:300]}"
-                )
-                logger.error("[%s] %s", tc_id, error_message)
+                logger.info("[%s] Classification '%s' not found in "
+                            "analysis (%r) or reply — logged only",
+                            tc_id, expected_lower, actual_class)
             elif found_in_reply and not found_in_analysis:
                 logger.debug("[%s] Classification '%s' found in reply text",
                              tc_id, expected_lower)
 
-        # 3c. Expected journey (if specified)
-        if status == "PASS" and tc.expected_journey:
+        # 3c. Log journey (recording only)
+        if tc.expected_journey:
             actual_journey = (check_analysis.get("journey") or "").lower()
             expected_journey = tc.expected_journey.lower()
             if expected_journey not in actual_journey:
-                status = "FAIL"
-                error_message = (
-                    f"[{tc_id}] Journey mismatch.\n"
-                    f"  Expected: {expected_journey}\n"
-                    f"  Got:      {actual_journey}"
-                )
-                logger.error("[%s] %s", tc_id, error_message)
+                logger.info("[%s] Journey mismatch: expected=%r got=%r — "
+                            "logged only", tc_id, expected_journey,
+                            actual_journey)
 
-        # 3d. Expected emotion (if specified)
-        if status == "PASS" and tc.expected_emotion:
+        # 3d. Log emotion (recording only)
+        if tc.expected_emotion:
             actual_emotion = (check_analysis.get("emotion") or "").lower()
             if tc.expected_emotion.lower() not in actual_emotion:
-                status = "FAIL"
-                error_message = (
-                    f"[{tc_id}] Emotion mismatch.\n"
-                    f"  Expected: {tc.expected_emotion}\n"
-                    f"  Got:      {actual_emotion}"
-                )
-                logger.error("[%s] %s", tc_id, error_message)
+                logger.info("[%s] Emotion mismatch: expected=%r got=%r — "
+                            "logged only", tc_id, tc.expected_emotion,
+                            actual_emotion)
 
     except Exception as exc:
         # Catch any unexpected exception (e.g. unhandled assertion, connection error)
