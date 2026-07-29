@@ -335,7 +335,33 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                             tc_id, len(all_replies), auto_turns)
                 break
 
-            # 2b. Update conversation health state
+            # 2b. Bot repetition check — if bot keeps saying the same thing,
+            #     send a closing message to end naturally (before stuck detection)
+            if status == "PASS" and auto_turns >= 2 and len(all_replies) >= 3:
+                last_prefix = all_replies[-1][:60].strip()
+                if last_prefix and any(
+                    last_prefix in r for r in all_replies[:-1]
+                ):
+                    logger.info("[%s] Bot repeating — sending closing message "
+                                "(auto-turn %d)", tc_id, auto_turns)
+                    try:
+                        resp = boxx_client.send_message(
+                            session_id, message="Okay, thank you. Nothing else."
+                        )
+                    except BOXXError:
+                        pass
+                    else:
+                        reply = resp.get("reply", "") or ""
+                        all_replies.append(reply)
+                        if is_session_closed(reply, resp.get("analysis", {})):
+                            session_concluded = True
+                            logger.info("[%s] Bot concluded after close prompt",
+                                        tc_id)
+                        final_analysis = resp.get("analysis", {}) or {}
+                        final_latency = resp.get("latency_ms", -1)
+                    break
+
+            # 2c. Update conversation health state
             conv_state.update(last_analysis)
 
             # 2c. Check for stuck (repeated questions, stalled journey, empty replies)

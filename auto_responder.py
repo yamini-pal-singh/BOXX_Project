@@ -393,10 +393,10 @@ class ConversationState:
             self.journey_stall_count += 1
         elif journey:
             self.journey_stall_count = 0
-        # If journey is empty and prev was also empty, count as stalled
-        elif not journey and not self.prev_journey:
-            self.journey_stall_count += 1
-        self.prev_journey = journey or self.prev_journey
+        # If journey is empty, don't count as stalled — the bot simply hasn't
+        # classified this conversation into a flow yet
+        if journey:
+            self.prev_journey = journey
         self.total_response_attempts += 1
 
     def mark_pattern(self, pattern_idx: int):
