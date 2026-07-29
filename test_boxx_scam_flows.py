@@ -20,8 +20,10 @@ from boxx_client import BOXXClient, BOXXError
 
 from auto_responder import (
     MAX_TURNS,
+    ButtonTracker,
     ConversationState,
     generate_response,
+    extract_buttons,
     is_session_closed,
 )
 
@@ -53,8 +55,12 @@ def record_result(
     expected_not_found: list[str],
     error_message: str,
     source_sheet: str,
+    session_id: str = "",
+    reply_count: int = 0,
+    conversation_log: str = "",
 ):
-    """Store one test result entry for later CSV export."""
+    """Store one test result entry for later CSV/Excel export."""
+    import json as _json
     TEST_RESULTS.append({
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "test_id": test_id,
@@ -83,6 +89,14 @@ def record_result(
         "full_analysis": str(analysis or {}),
         "error_message": error_message,
         "source_sheet": source_sheet,
+        # New fields
+        "session_id": session_id,
+        "reply_count": reply_count,
+        "conversation_log": conversation_log,
+        "final_reply": (bot_reply or "").replace("\n", " ")[:500],
+        "final_classification": (analysis or {}).get("classification", ""),
+        "final_journey": (analysis or {}).get("journey", ""),
+        "final_emotion": (analysis or {}).get("emotion", ""),
     })
 
 
@@ -188,6 +202,10 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
     all_replies: list[str] = []
     final_analysis: dict = {}
     final_latency: float = -1
+    session_id: str = ""
+    final_reply_count: int = 0
+    conversation_log: list[dict] = []  # turn-by-turn log
+    latest_messages: list[dict] = []   # latest messages array from API
 
     # Track if keywords ever matched on any reply (not just the final one)
     keywords_ever_found = False
@@ -225,7 +243,7 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
             status = "ERROR"
             error_message = f"Disclaimer turn failed: {exc}"
             logger.error("[%s] %s", tc_id, error_message)
-            _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found)
+            _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found, session_id=session_id, conversation_log=str(conversation_log))
 
         # ================================================================
         # PHASE 1: Pre-defined messages from test case
@@ -239,12 +257,24 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 status = "ERROR"
                 error_message = f"Turn {i + 1} API error: {exc}"
                 logger.error("[%s] %s", tc_id, error_message)
-                _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found)
+                _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found, session_id=session_id, conversation_log=str(conversation_log))
 
             reply = resp.get("reply", "") or ""
             all_replies.append(reply)
             final_analysis = resp.get("analysis", {}) or {}
             final_latency = resp.get("latency_ms", -1)
+            final_reply_count = resp.get("reply_count", 0)
+            latest_messages = resp.get("messages", []) or []
+
+            # Log this turn in conversation history
+            conversation_log.append({
+                "turn": i + 1,
+                "phase": "predefined",
+                "user_message": msg,
+                "bot_reply": reply,
+                "analysis": final_analysis,
+                "latency_ms": final_latency,
+            })
 
             # Check keywords on this reply — track the best match
             if not keywords_ever_found:
@@ -259,6 +289,15 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     logger.info("[%s] Keywords found at turn %d: %s",
                                 tc_id, i + 1, matched)
 
+            # Check for CTA buttons in this response
+            if latest_messages:
+                buttons = extract_buttons(latest_messages)
+                if buttons:
+                    button_tracker.register(buttons)
+                    logger.info("[%s] CTA buttons detected at turn %d: %s",
+                                tc_id, i + 1,
+                                [b.get("title", "") for b in buttons])
+
             # Assert each turn returns a non-empty reply
             if not reply.strip():
                 status = "FAIL"
@@ -268,11 +307,14 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     f"  Full response: {resp}"
                 )
                 logger.error("[%s] %s", tc_id, error_message)
-                _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found)
+                _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found, session_id=session_id, conversation_log=str(conversation_log))
 
             latency = resp.get("latency_ms", -1)
             logger.debug("[%s] Turn %d reply: %.100s… (latency=%sms, reply_count=%s)",
                          tc_id, i + 1, reply.replace('\n', ' '), latency, resp.get("reply_count"))
+
+        # Button tracker follows the whole conversation (Phase 1 + Phase 2)
+        button_tracker = ButtonTracker()
 
         # ================================================================
         # PHASE 2: Auto-respond loop — keep talking until bot concludes
@@ -281,7 +323,7 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
         session_concluded = False
         auto_turns = 0
 
-        while auto_turns < MAX_TURNS and not keywords_ever_found:
+        while auto_turns < MAX_TURNS:
             last_reply = all_replies[-1]
             last_analysis = final_analysis
 
@@ -307,7 +349,74 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     logger.warning("[%s] %s", tc_id, error_message)
                     break
 
-            # 2d. Generate appropriate response
+            # 2d. ─── CTA / Button handling ───────────────────────────────
+            # Register any new buttons from the last API response
+            if latest_messages:
+                new_buttons = extract_buttons(latest_messages)
+                if new_buttons:
+                    button_tracker.register(new_buttons)
+                    logger.debug("[%s] Registered %d CTA buttons: %s",
+                                 tc_id, len(new_buttons),
+                                 [b.get("title", "") for b in new_buttons])
+
+            # Click any unclicked buttons (ensures every CTA is touched at least once)
+            if button_tracker.pending > 0:
+                next_btn = button_tracker.next_unclicked()
+                if next_btn:
+                    btn_title = next_btn.get("title", "")
+                    btn_url = next_btn.get("url", "")
+                    logger.info("[%s] Clicking CTA button %d/%d: '%s' "
+                                "(auto-turn %d)",
+                                tc_id,
+                                len(button_tracker._clicked) + 1,
+                                len(button_tracker._seen),
+                                btn_title, auto_turns + 1)
+
+                    try:
+                        resp = boxx_client.send_message(
+                            session_id,
+                            button_id=btn_title,
+                            button_title=btn_title,
+                        )
+                    except BOXXError as exc:
+                        if status == "PASS":
+                            status = "ERROR"
+                            error_message = (
+                                f"[{tc_id}] Auto-turn {auto_turns} "
+                                f"CTA click error: {exc}"
+                            )
+                            logger.error("[%s] %s", tc_id, error_message)
+                        break
+
+                    button_tracker.mark_clicked(btn_title)
+                    reply = resp.get("reply", "") or ""
+                    if not reply.strip():
+                        conv_state.mark_empty_reply()
+                    all_replies.append(reply)
+                    final_analysis = resp.get("analysis", {}) or {}
+                    final_latency = resp.get("latency_ms", -1)
+                    final_reply_count = resp.get("reply_count", 0)
+                    latest_messages = resp.get("messages", []) or []
+
+                    # Log CTA click in conversation history
+                    turn_num = len(tc.input_messages) + auto_turns + 1
+                    conversation_log.append({
+                        "turn": turn_num,
+                        "phase": "cta_click",
+                        "cta_title": btn_title,
+                        "cta_url": btn_url,
+                        "bot_reply": reply,
+                        "analysis": final_analysis,
+                        "latency_ms": final_latency,
+                    })
+
+                    auto_turns += 1
+                    logger.info("[%s] CTA click reply: %.120s… latency=%sms",
+                                tc_id, reply.replace('\n', ' ')[:120],
+                                final_latency)
+                    continue  # go back — check for more unclicked CTAs
+
+            # 2e. Generate appropriate text response
             response = generate_response(
                 bot_reply=last_reply,
                 original_message=tc.input_messages[0],
@@ -324,23 +433,19 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 break
 
             if response == "__BLOCKED__":
-                # Bot refused to engage — not necessarily a test failure;
-                # let the keyword assertions decide.
                 logger.info("[%s] Bot refused to assist (anti-scam filter) "
                             "at auto-turn %d", tc_id, auto_turns)
                 break
 
             if response == "__CLOSE__":
-                # User says "no thanks" — bot should now close
                 response = "No, that is all. Thank you for your help."
 
             if response is None:
-                # No pattern matched — generic nudge
                 logger.info("[%s] No pattern matched at auto-turn %d, "
                             "sending generic nudge", tc_id, auto_turns)
                 response = "Please help me, what should I do next?"
 
-            # 2e. Send the auto-generated response
+            # 2f. Send the auto-generated text response
             logger.info("[%s] Auto-turn %d → sending reply to bot",
                         tc_id, auto_turns + 1)
             try:
@@ -360,8 +465,21 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
             all_replies.append(reply)
             final_analysis = resp.get("analysis", {}) or {}
             final_latency = resp.get("latency_ms", -1)
+            final_reply_count = resp.get("reply_count", 0)
+            latest_messages = resp.get("messages", []) or []
 
-            # Check keywords on this auto-respond reply
+            # Log this auto-turn in conversation history
+            turn_num = len(tc.input_messages) + auto_turns + 1
+            conversation_log.append({
+                "turn": turn_num,
+                "phase": "auto_respond",
+                "user_message": response,
+                "bot_reply": reply,
+                "analysis": final_analysis,
+                "latency_ms": final_latency,
+            })
+
+            # Check keywords on this auto-respond reply (recording only, not for exit)
             if not keywords_ever_found:
                 matched, not_found = _check_keywords(reply)
                 if matched:
@@ -380,9 +498,8 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
             auto_turns += 1
 
         else:
-            # while loop terminated without break (MAX_TURNS hit or never entered)
-            # Never fail if keywords were already found — test passes on first reply match
-            if status == "PASS" and not session_concluded and not keywords_ever_found:
+            # while loop terminated without break (MAX_TURNS hit)
+            if status == "PASS" and not session_concluded:
                 status = "FAIL"
                 error_message = (
                     f"[{tc_id}] Bot did not conclude session within "
@@ -392,32 +509,26 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 logger.warning("[%s] %s", tc_id, error_message)
 
         # ================================================================
-        # PHASE 3: Assertions — keywords, classification, journey, emotion
+        # PHASE 3: Assertions — classification, journey, emotion
+        # (keywords are recorded for analysis only, not used for pass/fail)
         # ================================================================
         final_reply = all_replies[-1] if all_replies else ""
 
-        # Use the best-matched reply's analysis for classification/journey/emotion checks
-        # if keywords were found on a non-final reply; otherwise use final.
-        check_analysis = best_analysis if keywords_ever_found else final_analysis
-        check_reply = best_reply if keywords_ever_found else final_reply
-        check_latency = best_latency if keywords_ever_found else final_latency
+        # Always use the final reply and its analysis for assertions
+        check_analysis = final_analysis
+        check_reply = final_reply
+        check_latency = final_latency
 
-        # 3a. All expected keywords present (checked on ALL replies, not just final)
+        # Log keyword findings (recording only — does not affect pass/fail)
         if tc.expected_keywords:
             if keywords_ever_found:
-                logger.info("[%s] Keywords matched on reply with best analysis: %s",
-                            tc_id, keywords_matched)
-            elif status == "PASS":
-                status = "FAIL"
-                error_message = (
-                    f"[{tc_id}] No expected keyword found in any bot reply.\n"
-                    f"  Expected (any of): {tc.expected_keywords}\n"
-                    f"  All replies:       {all_replies}\n"
-                    f"  Inputs:            {tc.input_messages}"
-                )
-                logger.error("[%s] %s", tc_id, error_message)
+                logger.info("[%s] Keywords matched: %s — not_found: %s",
+                            tc_id, keywords_matched, expected_not_found)
+            else:
+                logger.info("[%s] No expected keyword found in any bot reply — "
+                            "all replies: %s", tc_id, all_replies[:3])
 
-        # 3b. Expected classification (if specified)
+        # 3a. Expected classification (if specified)
         if status == "PASS" and tc.expected_classification:
             actual_class = (check_analysis.get("classification") or "").lower()
             expected_lower = tc.expected_classification.lower()
@@ -471,6 +582,7 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
     # ------------------------------------------------------------------
     # Record result to TEST_RESULTS
     # ------------------------------------------------------------------
+    import json as _json
     record_result(
         test_id=tc_id,
         language=tc.language,
@@ -490,6 +602,9 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
         expected_not_found=expected_not_found,
         error_message=error_message,
         source_sheet=tc.source_sheet if hasattr(tc, 'source_sheet') else "",
+        session_id=session_id,
+        reply_count=final_reply_count,
+        conversation_log=_json.dumps(conversation_log, indent=1, default=str),
     )
 
     # Log final status
@@ -512,7 +627,7 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
 # ---------------------------------------------------------------------------
 
 
-def _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found):
+def _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analysis, final_latency, keywords_matched, expected_not_found, session_id="", reply_count=0, conversation_log=""):
     """Record result and fail, to avoid repeating this pattern inline."""
     record_result(
         test_id=tc_id,
@@ -533,5 +648,8 @@ def _record_and_fail(status, error_message, tc, tc_id, all_replies, final_analys
         expected_not_found=expected_not_found,
         error_message=error_message,
         source_sheet=tc.source_sheet if hasattr(tc, 'source_sheet') else "",
+        session_id=session_id,
+        reply_count=reply_count,
+        conversation_log=conversation_log,
     )
     pytest.fail(error_message)

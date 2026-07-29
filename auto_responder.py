@@ -24,6 +24,81 @@ EMPTY_REPLY_LIMIT = 2          # empty replies → stuck
 
 
 # ---------------------------------------------------------------------------
+# CTA / Button tracking
+# ---------------------------------------------------------------------------
+
+
+def extract_buttons(messages: list[dict]) -> list[dict]:
+    """Extract all unique CTA buttons from API response messages.
+
+    Each message may have ``type="interactive"`` with ``interactive_data``
+    containing ``buttons`` with ``title``, ``url``, and ``type`` fields.
+    Returns deduplicated list keyed by ``title``.
+    """
+    if not messages:
+        return []
+    buttons: list[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("type") != "interactive":
+            continue
+        idata = msg.get("interactive_data")
+        if not idata or not isinstance(idata, dict):
+            continue
+        for btn in idata.get("buttons") or []:
+            if isinstance(btn, dict) and btn.get("title"):
+                buttons.append(btn)
+    # Deduplicate by title (first occurrence wins)
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for b in buttons:
+        t = b.get("title", "")
+        if t and t not in seen:
+            seen.add(t)
+            unique.append(b)
+    return unique
+
+
+class ButtonTracker:
+    """Tracks which CTA buttons have been presented and clicked during a conversation."""
+
+    def __init__(self):
+        self._seen: list[dict] = []       # all unique buttons seen, in order
+        self._clicked: set[str] = set()    # titles that have been clicked
+
+    def register(self, buttons: list[dict]):
+        """Register newly-seen buttons that haven't been seen before."""
+        known = {b.get("title", "") for b in self._seen}
+        for b in buttons:
+            t = b.get("title", "")
+            if t and t not in known:
+                self._seen.append(b)
+                known.add(t)
+
+    def next_unclicked(self) -> Optional[dict]:
+        """Return the first button whose title hasn't been clicked yet, or None."""
+        for b in self._seen:
+            if b.get("title", "") not in self._clicked:
+                return b
+        return None
+
+    def mark_clicked(self, title: str):
+        """Record that a button with *title* was clicked."""
+        if title:
+            self._clicked.add(title)
+
+    @property
+    def all_clicked(self) -> bool:
+        """True when every seen button has been clicked at least once."""
+        return not bool(self._seen) or len(self._clicked) >= len(self._seen)
+
+    @property
+    def pending(self) -> int:
+        return len(self._seen) - len(self._clicked)
+
+
+# ---------------------------------------------------------------------------
 # Pattern → response tables
 # ---------------------------------------------------------------------------
 
