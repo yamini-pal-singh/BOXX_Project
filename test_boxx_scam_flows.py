@@ -24,6 +24,7 @@ from auto_responder import (
     ConversationState,
     generate_response,
     extract_buttons,
+    extract_choice_buttons,
     is_session_closed,
 )
 
@@ -229,6 +230,9 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                 tc_id, tc.language, len(tc.input_messages), tc.expected_keywords)
 
     try:
+        # Button tracker follows the whole conversation (Phase 1 + Phase 2)
+        button_tracker = ButtonTracker()
+
         # 1. Create a fresh session in the specified language
         session_id = boxx_client.create_session(
             language=tc.language,
@@ -313,9 +317,6 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
             logger.debug("[%s] Turn %d reply: %.100s… (latency=%sms, reply_count=%s)",
                          tc_id, i + 1, reply.replace('\n', ' '), latency, resp.get("reply_count"))
 
-        # Button tracker follows the whole conversation (Phase 1 + Phase 2)
-        button_tracker = ButtonTracker()
-
         # ================================================================
         # PHASE 2: Auto-respond loop — keep talking until bot concludes
         # ================================================================
@@ -349,28 +350,28 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     logger.warning("[%s] %s", tc_id, error_message)
                     break
 
-            # 2d. ─── CTA / Button handling ───────────────────────────────
-            # Register any new buttons from the last API response
+            # 2d. Register any new choice buttons from the last API response
+            #     (skip action links like "Call 1930" / "Open link")
             if latest_messages:
-                new_buttons = extract_buttons(latest_messages)
+                new_buttons = extract_choice_buttons(latest_messages)
                 if new_buttons:
                     button_tracker.register(new_buttons)
-                    logger.debug("[%s] Registered %d CTA buttons: %s",
+                    logger.debug("[%s] Registered %d choice buttons: %s",
                                  tc_id, len(new_buttons),
                                  [b.get("title", "") for b in new_buttons])
 
-            # Click any unclicked buttons (ensures every CTA is touched at least once)
-            if button_tracker.pending > 0:
-                next_btn = button_tracker.next_unclicked()
-                if next_btn:
+            # 2e. If the latest bot response has choice buttons, click ONE
+            #     (choice buttons take priority over text — follow the path naturally)
+            if latest_messages:
+                response_buttons = extract_choice_buttons(latest_messages)
+                unclicked = [b for b in response_buttons
+                             if b.get("title", "") not in button_tracker._clicked]
+                if unclicked:
+                    next_btn = unclicked[0]
                     btn_title = next_btn.get("title", "")
                     btn_url = next_btn.get("url", "")
-                    logger.info("[%s] Clicking CTA button %d/%d: '%s' "
-                                "(auto-turn %d)",
-                                tc_id,
-                                len(button_tracker._clicked) + 1,
-                                len(button_tracker._seen),
-                                btn_title, auto_turns + 1)
+                    logger.info("[%s] Clicking CTA '%s' (auto-turn %d)",
+                                tc_id, btn_title, auto_turns + 1)
 
                     try:
                         resp = boxx_client.send_message(
@@ -388,7 +389,12 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                             logger.error("[%s] %s", tc_id, error_message)
                         break
 
-                    button_tracker.mark_clicked(btn_title)
+                    # Mark ALL buttons from this response as clicked
+                    # (they were alternatives in the same response —
+                    #  clicking one dismisses the others)
+                    for btn in response_buttons:
+                        button_tracker.mark_clicked(btn.get("title", ""))
+
                     reply = resp.get("reply", "") or ""
                     if not reply.strip():
                         conv_state.mark_empty_reply()
@@ -398,7 +404,6 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     final_reply_count = resp.get("reply_count", 0)
                     latest_messages = resp.get("messages", []) or []
 
-                    # Log CTA click in conversation history
                     turn_num = len(tc.input_messages) + auto_turns + 1
                     conversation_log.append({
                         "turn": turn_num,
@@ -414,9 +419,9 @@ def test_boxx_scenarios(boxx_client: BOXXClient, test_case):
                     logger.info("[%s] CTA click reply: %.120s… latency=%sms",
                                 tc_id, reply.replace('\n', ' ')[:120],
                                 final_latency)
-                    continue  # go back — check for more unclicked CTAs
+                    continue  # next iteration — check new response for more CTAs
 
-            # 2e. Generate appropriate text response
+            # 2f. No CTAs in latest response — use text auto-responder
             response = generate_response(
                 bot_reply=last_reply,
                 original_message=tc.input_messages[0],

@@ -60,6 +60,19 @@ def extract_buttons(messages: list[dict]) -> list[dict]:
     return unique
 
 
+def extract_choice_buttons(messages: list[dict]) -> list[dict]:
+    """Like :func:`extract_buttons` but filters out action-link buttons.
+
+    Action links (e.g. "Call 1930" → ``tel:1930``, "Open link" → ``https://…``)
+    have a ``url`` field and represent external actions.  Choice buttons have
+    *no* ``url`` field and represent navigation options (e.g. "Yes", "No",
+    "Continue current journey") — these are the ones a real user would click
+    to choose a conversation path.
+    """
+    all_buttons = extract_buttons(messages)
+    return [b for b in all_buttons if not b.get("url")]
+
+
 class ButtonTracker:
     """Tracks which CTA buttons have been presented and clicked during a conversation."""
 
